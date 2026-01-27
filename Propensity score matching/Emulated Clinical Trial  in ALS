@@ -1,0 +1,634 @@
+###########################################################################################################
+# Emulated Clinical Trial  in ALS: Furosemide vs other cardiovascular drugs using Propensity Score Matching
+# Dataset: PROACT (Pooled Resource Open-Access ALS Clinical Trials)
+###########################################################################################################
+
+################################################################################
+# 1. SETUP AND LIBRARY LOADING
+################################################################################
+
+# Load required libraries
+library(data.table)      
+library(dplyr) 
+library(stringr) 
+library(survival)  
+library(survminer)   
+library(lme4)        
+library(MatchIt)         
+
+################################################################################
+# 2. LOAD AND PREPARE BASELINE DEMOGRAPHIC DATA
+################################################################################
+
+cat("\n=== Loading PROACT Database Files ===\n")
+
+#-------------------------------------------------------------------------------
+# 2.1 ALS History Data: Onset timing and bulbar involvement
+#-------------------------------------------------------------------------------
+# Load clinical history data
+history_data <- fread("/Users/macbook/Downloads/PROACT_ALSHISTORY2025.csv")
+
+cat("Loaded ALS history data:", nrow(history_data), "records\n")
+
+# Create bulbar onset indicator using multiple field
+# Bulbar onset is identified through:
+#   - Explicit bulbar onset site fields
+#   - Initial symptoms (speech/swallowing)
+#   - Anatomical location descriptions of initial symptoms suggesting bulbar involvement
+history_data <- history_data %>%
+  mutate(
+    Bulbar_onset_verified = case_when(
+      Site_of_Onset___Bulbar == 1 ~ 1,
+      Site_of_Onset == "Onset: Bulbar" ~ 1,
+      Symptom %in% c("Speech", "Swallowing") ~ 1,
+      str_detect(Location, regex(
+        "Bulb|Bucal|Bubl|Chocking|Deglutition|Dysarth|Face|Facial|Mouth|
+        Nasal|Pharynx|Nose|Oral|Oro|Pharyng|Voice|Slurred|Slurring|
+        Speech|Swallow|Throat|Tongue|Vocal", 
+        ignore_case = TRUE)) ~ 1,
+      # Default: non-bulbar onset
+      TRUE ~ 0
+    )
+  )
+
+# Select only required variables and keep one record per subject to ensure no duplicates are retained
+# Remove subjects with missing onset timing or bulbar classification
+history_data <- history_data %>%
+  filter(!is.na(Onset_Delta), !is.na(Bulbar_onset_verified)) %>%
+  select(subject_id, Onset_Delta, Bulbar_onset_verified) %>%
+  distinct(subject_id, .keep_all = TRUE)
+
+cat("After cleaning - History data:", nrow(history_data), "subjects\n")
+
+#-------------------------------------------------------------------------------
+# 2.2 Demographics Data: Age and sex
+#-------------------------------------------------------------------------------
+# Load demographic information
+demographics_data <- fread("/Users/macbook/Downloads/PROACT_DEMOGRAPHICS2025.csv")
+
+cat("Loaded demographics data:", nrow(demographics_data), "records\n")
+
+# Select required variables and remove subjects with missing age or sex
+demographics_data <- demographics_data %>%
+  filter(!is.na(Age), !is.na(Sex)) %>%
+  select(subject_id, Age, Sex) %>%
+  distinct(subject_id, .keep_all = TRUE)
+
+cat("After cleaning - Demographics data:", nrow(demographics_data), "subjects\n")
+
+#-------------------------------------------------------------------------------
+# 2.3 Death Data: Survival outcomes
+#-------------------------------------------------------------------------------
+# Load mortality data
+death_data <- fread("/Users/macbook/Downloads/PROACT_DEATHDATA2025.csv")
+
+cat("Loaded death data:", nrow(death_data), "records\n")
+
+# Select survival status and time to death
+death_data <- death_data %>%
+  select(subject_id, Subject_Died, Death_Days) %>%
+  distinct(subject_id, .keep_all = TRUE)
+
+cat("After cleaning - Death data:", nrow(death_data), "subjects\n")
+
+#-------------------------------------------------------------------------------
+# 2.4 Merge baseline covariates
+#-------------------------------------------------------------------------------
+# Combine all baseline data sources
+# Only subjects present in all three datasets are retained
+Baseline_covariates <- history_data %>%
+  inner_join(demographics_data, by = "subject_id") %>%
+  inner_join(death_data, by = "subject_id")
+
+# Print number of cases in the merged dataset
+cat("\n=== Baseline Covariates Dataset Summary ===\n")
+cat("Merged dataset:", nrow(Baseline_covariates), "subjects\n")
+
+# Create working dataset and remove any remaining missing values in key variables
+PROACT_for_ECT <- Baseline_covariates %>%
+  filter(!is.na(Age), !is.na(Sex), !is.na(Onset_Delta), !is.na(Subject_Died))
+
+cat("After removing missing values:", nrow(PROACT_for_ECT), "subjects\n")
+
+################################################################################
+# 3. LOAD AND PREPARE ALSFRS DATA
+################################################################################
+
+cat("\n=== Processing ALSFRS Functional Scores ===\n")
+
+# Load ALSFRS (ALS Functional Rating Scale) data
+alsfrs_data <- fread("Downloads/PROACT_ALSFRS2025.csv")
+
+cat("Loaded ALSFRS data:", nrow(alsfrs_data), "records\n")
+
+# Select baseline ALSFRS (earliest measurement per subject)
+# Exclude subjects with significant clinical respiratory involvement at baseline:
+# This ensures we're analyzing patients without respiratory compromise
+ALSFRS_earliest <- alsfrs_data %>%
+  group_by(subject_id) %>%
+  slice_min(order_by = ALSFRS_Delta, with_ties = FALSE) %>%
+  filter(
+    R_3_Respiratory_Insufficiency + R_2_Orthopnea + R_1_Dyspnea > 10
+  ) %>%
+  select(subject_id, ALSFRS_Delta) %>%
+  ungroup()
+
+cat("Baseline ALSFRS (excluding respiratory involvement):", nrow(ALSFRS_earliest), "subjects\n")
+
+# Merge baseline covariates with ALSFRS data
+BASE_PROACT <- PROACT_for_ECT %>%
+  left_join(ALSFRS_earliest, by = "subject_id")
+
+cat("Combined baseline dataset:", nrow(BASE_PROACT), "subjects\n")
+cat("Subjects with ALSFRS data:", sum(!is.na(BASE_PROACT$ALSFRS_Delta)), "\n")
+
+################################################################################
+# 4. LOAD MEDICATION DATA AND DEFINE TREATMENT GROUPS
+################################################################################
+
+cat("\n=== Processing Medication Exposure Data ===\n")
+
+# Load concomitant medications data
+medication_data <- fread("Downloads/PROACT_CONMEDS2025.csv")
+
+cat("Loaded medication data:", nrow(medication_data), "records\n")
+
+# Calculate medication duration (days)
+medication_data <- medication_data %>%
+  mutate(Time = Stop_Delta - Start_Delta)
+
+#-------------------------------------------------------------------------------
+# 4.1 Define cardiovascular medication patterns
+#-------------------------------------------------------------------------------
+# Define cardiovascular medication classes using string patterns
+# This approach captures all formulations and combinations elegantly
+# 
+# Drug classes included:
+#   - Diuretics: furosemide, torasemide, HCTZ combinations
+#   - Calcium channel blockers: amlodipine, diltiazem, felodipine, nifedipine, verapamil
+#   - ACE inhibitors: -pril drugs (enalapril, lisinopril, ramipril, etc.)
+#   - ARBs: -sartan drugs (losartan, valsartan, candesartan, etc.)
+#   - Beta-blockers: -olol drugs (metoprolol, atenolol, bisoprolol, etc.)
+#   - Alpha-2 agonists: clonidine
+#   - Nitrates: isosorbide
+
+cardiovascular_drug_patterns <- c(
+  "PRIL",                 # ACE inhibitors (all -pril drugs)
+  "SARTAN",               # ARBs (all -sartan drugs)
+  "OLOL",                 # Beta-blockers (all -olol drugs)
+  "AMLODIPINE", "DILTIAZEM", "FELODIPINE", "NIFEDIPINE", "VERAPAMIL", "ISRADIPINE",           # Calcium channel blocker
+  "FUROSEMIDE", "TORASEMIDE","HYDROCHLOROTHIAZIDE","TRIAMTERENE",           # Diuretics
+  "CLONIDINE",            # Alpha-2 agonist
+  "ISOSORBIDE"            # Nitrate
+)
+
+# Create regex pattern to match any cardiovascular medication
+cardiovascular_pattern <- paste(cardiovascular_drug_patterns, collapse = "|")
+
+cat("\n=== Identifying Cardiovascular Medications ===\n")
+cat("Using pattern matching for drug classes:\n")
+cat(paste(cardiovascular_drug_patterns, collapse = ", "), "\n\n")
+
+# Identify all cardiovascular medications in the dataset
+cardiovascular_counts <- medication_data %>%
+  filter(str_detect(Medication_Coded, regex(cardiovascular_pattern, ignore_case = TRUE))) %>%
+  group_by(Medication_Coded) %>%
+  summarise(n_subjects = n_distinct(subject_id)) %>%
+  arrange(desc(n_subjects))
+
+cat("Total unique cardiovascular medications identified:", nrow(cardiovascular_counts), "\n")
+cat("\n=== Top 20 Cardiovascular Medications by Frequency ===\n")
+print(cardiovascular_counts, n = 20)
+
+#-------------------------------------------------------------------------------
+# 4.2 Automatically select top 10 cardiovascular medications (excluding furosemide)
+#-------------------------------------------------------------------------------
+# Extract base drug name (remove formulations, combinations, and dose info)
+# This groups different formulations of the same drug together
+cardiovascular_counts_base <- medication_data %>%
+  filter(str_detect(Medication_Coded, regex(cardiovascular_pattern, ignore_case = TRUE))) %>%
+  # Extract base drug name by removing common suffixes and combinations
+  mutate(
+    Base_Drug = str_remove_all(Medication_Coded, 
+                               regex("MALEATE|BESYLATE|BESILATE|TARTRATE|SUCCINATE|
+                                     FUMARATE|CILEXETIL|MEDOXOMIL|ERBUMINE|
+                                     HYDROCHLORIDE|HYDROCHLOR\\.|XL|XR|
+                                     W/.*|;.*|/.*|-.*|\\s+[0-9]+MG.*", 
+                                     ignore_case = TRUE)),
+    Base_Drug = str_trim(Base_Drug)
+  ) %>%
+  group_by(Base_Drug) %>%
+  summarise(n_subjects = n_distinct(subject_id)) %>%
+  arrange(desc(n_subjects))
+
+cat("\n=== Cardiovascular Medications Grouped by Base Drug ===\n")
+print(cardiovascular_counts_base, n = 15)
+
+# Select top 10 most prescribed cardiovascular drugs, excluding furosemide
+top_10_drugs <- cardiovascular_counts_base %>%
+  filter(Base_Drug != "FUROSEMIDE") %>%
+  slice_head(n = 10) %>%
+  pull(Base_Drug)
+
+cat("\n=== Automatically Selected Top 10 Cardiovascular Medications ===\n")
+cat("(Excluding furosemide, based on number of exposed subjects)\n\n")
+for (i in seq_along(top_10_drugs)) {
+  n_subjects <- cardiovascular_counts_base %>% 
+    filter(Base_Drug == top_10_drugs[i]) %>% 
+    pull(n_subjects)
+  cat(sprintf("%2d. %-20s (n = %d subjects)\n", i, top_10_drugs[i], n_subjects))
+}
+
+# Create pattern to match any formulation of the top 10 drugs
+top_cardiovascular_pattern <- paste(top_10_drugs, collapse = "|")
+
+#-------------------------------------------------------------------------------
+# 4.3 Identify treatment groups based on pre-enrollment medication exposure
+#-------------------------------------------------------------------------------
+# Treatment exposure criteria:
+#   - Medication started before enrollment (Start_Delta < 0)
+#   - Ongoing at enrollment (no stop date), treatment duration >= 60 days, 
+
+# Subjects exposed to furosemide pre-enrollment
+Furosemide_treatment <- medication_data %>%
+  filter(
+    str_detect(Medication_Coded, regex("FUROSEMIDE", ignore_case = TRUE)),
+    Start_Delta < 0,
+    (Time > 60 | is.na(Stop_Delta))
+  )
+
+cat("\nSubjects with pre-enrollment furosemide exposure (≥60 days):", 
+    n_distinct(Furosemide_treatment$subject_id), "\n")
+
+# Subjects exposed to other top cardiovascular medications pre-enrollment
+Other_cardiovascular_treatment <- medication_data %>%
+  filter(
+    str_detect(Medication_Coded, regex(top_cardiovascular_pattern, ignore_case = TRUE)),
+    Start_Delta < 0,
+    (Time > 60 | is.na(Stop_Delta))
+  )
+
+cat("Subjects with pre-enrollment other cardiovascular drug exposure (≥60 days):", 
+    n_distinct(Other_cardiovascular_treatment$subject_id), "\n")
+
+# Display breakdown by specific drug for the comparison group (remove common suffix)
+cat("\n=== Comparison Group: Breakdown by Drug ===\n")
+Other_cardiovascular_treatment %>%
+  mutate(
+    Base_Drug = str_remove_all(Medication_Coded, 
+                               regex("MALEATE|BESYLATE|BESILATE|TARTRATE|SUCCINATE|
+                                     FUMARATE|CILEXETIL|MEDOXOMIL|ERBUMINE|
+                                     HYDROCHLORIDE|HYDROCHLOR\\.|XL|XR|
+                                     W/.*|;.*|/.*|-.*|\\s+[0-9]+MG.*", 
+                                     ignore_case = TRUE)),
+    Base_Drug = str_trim(Base_Drug)
+  ) %>%
+  group_by(Base_Drug) %>%
+  summarise(n_subjects = n_distinct(subject_id)) %>%
+  arrange(desc(n_subjects)) %>%
+  print(n = 10)
+
+#-------------------------------------------------------------------------------
+# 4.4 Identify riluzole users 
+#-------------------------------------------------------------------------------
+# Riluzole is the ALS disease-modifying therapy
+# We track riluzole use for propensity score matching
+Riluzole_treatment <- medication_data %>%
+  filter(Medication_Coded == "RILUZOLE")
+
+cat("Subjects with any riluzole exposure:", 
+    n_distinct(Riluzole_treatment$subject_id), "\n")
+
+################################################################################
+# 5. CREATE TREATMENT INDICATORS AND MERGE WITH BASELINE DATA
+################################################################################
+
+cat("\n=== Creating Treatment Group Indicators ===\n")
+
+# Create binary indicators for each treatment exposure
+# Subjects may appear in multiple groups if they took multiple medications
+
+# Furosemide
+Furosemide_subjects <- Furosemide_treatment %>%
+  distinct(subject_id) %>%
+  mutate(Furosemide = "yes")
+
+# Other cardiovascular drug
+Other_cardiovascular_subjects <- Other_cardiovascular_treatment %>%
+  distinct(subject_id) %>%
+  mutate(Other_drug = "yes")
+
+# Riluzole
+Riluzole_subjects <- Riluzole_treatment %>%
+  distinct(subject_id) %>%
+  mutate(Riluzole = "yes")
+
+# Merge treatment indicators with baseline dataset
+BASE_PROACT <- BASE_PROACT %>%
+  left_join(Furosemide_subjects, by = "subject_id") %>%
+  left_join(Other_cardiovascular_subjects, by = "subject_id") %>%
+  left_join(Riluzole_subjects, by = "subject_id") %>%
+  mutate(
+    Furosemide = ifelse(is.na(Furosemide), "no", Furosemide),
+    Other_drug = ifelse(is.na(Other_drug), "no", Other_drug),
+    Riluzole = ifelse(is.na(Riluzole), "no", Riluzole)
+  )
+
+# Summary of treatment groups
+cat("\nTreatment exposure summary:\n")
+cat("Furosemide users:", sum(BASE_PROACT$Furosemide == "yes"), "\n")
+cat("Other cardiovascular drug users:", sum(BASE_PROACT$Other_drug == "yes"), "\n")
+cat("Riluzole users:", sum(BASE_PROACT$Riluzole == "yes"), "\n")
+cat("Both furosemide and other cardiovascular drugs:", 
+    sum(BASE_PROACT$Furosemide == "yes" & BASE_PROACT$Other_drug == "yes"), "\n")
+
+################################################################################
+# 6. APPLY INCLUSION/EXCLUSION CRITERIA FOR EMULATED CLINICAL TRIAL
+################################################################################
+
+cat("\n=== Applying Study Inclusion/Exclusion Criteria ===\n")
+
+# Eligibility criteria for the emulated clinical trial:
+#   1. Age < 80 years
+#   2. Disease duration < 3 years at enrollment (Onset_Delta > -1095 days)
+#   3. No significant respiratory involvement at baseline (applied earlier in ALSFRS filtering)
+#   4. Must be taking at least one cardiovascular medication (furosemide or comparison drug)
+
+cat("Starting cohort:", nrow(BASE_PROACT), "subjects\n")
+
+# Select subjects meeting all eligibility criteria
+Furosemide_trial <- BASE_PROACT %>%
+  filter(Other_drug == "yes") %>%
+  filter(
+    Age < 80,
+    Onset_Delta > -1095
+  )
+
+cat("\nAfter applying inclusion/exclusion criteria:\n")
+cat("Total eligible subjects:", nrow(Furosemide_trial), "\n")
+cat("  - Furosemide users:", sum(Furosemide_trial$Furosemide == "yes"), "\n")
+cat("  - Other cardiovascular drug users (comparison):", 
+    sum(Furosemide_trial$Furosemide == "no"), "\n")
+
+# Check for missing data in key variables
+missing_summary <- Furosemide_trial %>%
+  summarise(
+    missing_age = sum(is.na(Age)),
+    missing_sex = sum(is.na(Sex)),
+    missing_bulbar = sum(is.na(Bulbar_onset_verified)),
+    missing_onset = sum(is.na(Onset_Delta)),
+    missing_riluzole = sum(is.na(Riluzole))
+  )
+
+cat("\nMissing data check:\n")
+print(missing_summary)
+
+################################################################################
+# 7. PREPARE DATASET FOR PROPENSITY SCORE MATCHING
+################################################################################
+
+cat("\n=== Preparing Variables for Propensity Score Matching ===\n")
+
+# Convert variables to appropriate formats for matching
+Furosemide_trial <- Furosemide_trial %>%
+  mutate(
+    Furosemide_0_1 = as.factor(ifelse(Furosemide == "yes", 1, 0)),
+    Riluzole_0_1 = as.factor(ifelse(Riluzole == "yes", 1, 0)),
+    Sex = as.factor(Sex)
+  )
+
+# Display baseline characteristics by treatment group
+cat("\n=== Baseline Characteristics Before Matching ===\n")
+cat("\nFurosemide Group (n =", sum(Furosemide_trial$Furosemide_0_1 == 1), "):\n")
+Furosemide_trial %>%
+  filter(Furosemide_0_1 == 1) %>%
+  summarise(
+    Mean_Age = mean(Age, na.rm = TRUE),
+    SD_Age = sd(Age, na.rm = TRUE),
+    Pct_Male = mean(Sex == "Male", na.rm = TRUE) * 100,
+    Pct_Bulbar = mean(Bulbar_onset_verified == 1, na.rm = TRUE) * 100,
+    Mean_Onset_Days = mean(Onset_Delta, na.rm = TRUE),
+    Pct_Riluzole = mean(Riluzole_0_1 == 1, na.rm = TRUE) * 100
+  ) %>%
+  print()
+
+cat("\nComparison Group (n =", sum(Furosemide_trial$Furosemide_0_1 == 0), "):\n")
+Furosemide_trial %>%
+  filter(Furosemide_0_1 == 0) %>%
+  summarise(
+    Mean_Age = mean(Age, na.rm = TRUE),
+    SD_Age = sd(Age, na.rm = TRUE),
+    Pct_Male = mean(Sex == "Male", na.rm = TRUE) * 100,
+    Pct_Bulbar = mean(Bulbar_onset_verified == 1, na.rm = TRUE) * 100,
+    Mean_Onset_Days = mean(Onset_Delta, na.rm = TRUE),
+    Pct_Riluzole = mean(Riluzole_0_1 == 1, na.rm = TRUE) * 100
+  ) %>%
+  print()
+
+################################################################################
+# 8. PERFORM PROPENSITY SCORE MATCHING
+################################################################################
+
+cat("\n=== Performing Propensity Score Matching ===\n")
+
+# Propensity score matching specification:
+#   - Method: Nearest neighbor matching without replacement
+#   - Ratio: 1:5 (each furosemide user matched to 5 comparison subjects)
+#   - Matching covariates:
+#       * Age (continuous)
+#       * Sex (binary)
+#       * Bulbar onset (binary)
+#       * Disease duration/Onset_Delta (continuous)
+#       * Riluzole use (binary)
+
+cat("Matching algorithm: Nearest neighbor without replacement\n")
+cat("Matching ratio: 1:5 (1 furosemide user : 5 comparison subjects)\n")
+cat("Matching covariates: Age, Sex, Bulbar_onset, Onset_Delta, Riluzole\n\n")
+
+psm_model <- matchit(
+  Furosemide_0_1 ~ Age + Sex + Bulbar_onset_verified + Onset_Delta + Riluzole_0_1,
+  data = Furosemide_trial,
+  method = "nearest",
+  ratio = 5,
+  replace = FALSE
+)
+
+# Display matching summary
+cat("=== Propensity Score Matching Results ===\n\n")
+summary(psm_model)
+
+################################################################################
+# 9. EXTRACT MATCHED DATASET AND ASSESS BALANCE
+################################################################################
+
+cat("\n=== Extracting Matched Cohort ===\n")
+
+# Extract the matched dataset with matching weights and subclass assignments
+matched_data <- match.data(psm_model)
+
+cat("Matched dataset size:", nrow(matched_data), "subjects\n")
+cat("  - Furosemide users:", sum(matched_data$Furosemide_0_1 == 1), "\n")
+cat("  - Matched comparison subjects:", sum(matched_data$Furosemide_0_1 == 0), "\n")
+cat("  - Number of matched sets:", length(unique(matched_data$subclass)), "\n")
+
+# Display post-matching characteristics
+cat("\n=== Baseline Characteristics After Matching ===\n")
+cat("\nFurosemide Group (n =", sum(matched_data$Furosemide_0_1 == 1), "):\n")
+matched_data %>%
+  filter(Furosemide_0_1 == 1) %>%
+  summarise(
+    Mean_Age = mean(Age, na.rm = TRUE),
+    SD_Age = sd(Age, na.rm = TRUE),
+    Pct_Male = mean(Sex == "Male", na.rm = TRUE) * 100,
+    Pct_Bulbar = mean(Bulbar_onset_verified == 1, na.rm = TRUE) * 100,
+    Mean_Onset_Days = mean(Onset_Delta, na.rm = TRUE),
+    Pct_Riluzole = mean(Riluzole_0_1 == 1, na.rm = TRUE) * 100
+  ) %>%
+  print()
+
+cat("\nMatched Comparison Group (n =", sum(matched_data$Furosemide_0_1 == 0), "):\n")
+matched_data %>%
+  filter(Furosemide_0_1 == 0) %>%
+  summarise(
+    Mean_Age = mean(Age, na.rm = TRUE),
+    SD_Age = sd(Age, na.rm = TRUE),
+    Pct_Male = mean(Sex == "Male", na.rm = TRUE) * 100,
+    Pct_Bulbar = mean(Bulbar_onset_verified == 1, na.rm = TRUE) * 100,
+    Mean_Onset_Days = mean(Onset_Delta, na.rm = TRUE),
+    Pct_Riluzole = mean(Riluzole_0_1 == 1, na.rm = TRUE) * 100
+  ) %>%
+  print()
+
+cat("\n=== Propensity Score Matching Complete ===\n")
+cat("Dataset ready for outcome analysis\n\n")
+
+################################################################################
+# 10. LONGITUDINAL ALSFRS-R ANALYSIS
+################################################################################
+
+cat("\n=== Longitudinal ALSFRS-R Analysis ===\n")
+
+#-------------------------------------------------------------------------------
+# 10.1 Prepare longitudinal dataset with matched subjects only
+#-------------------------------------------------------------------------------
+# Merge all ALSFRS-R measurements with matched cohort data
+Longitudinal_matched <- PROACT_ALSFRS %>%
+  inner_join(matched_data, by = "subject_id", suffix = c("_alsfrs", "_baseline"))
+
+cat("Longitudinal dataset:\n")
+cat("  - Subjects:", n_distinct(Longitudinal_matched$subject_id), "\n")
+cat("  - Total ALSFRS-R observations:", nrow(Longitudinal_matched), "\n")
+cat("  - Mean observations per subject:", 
+    round(nrow(Longitudinal_matched) / n_distinct(Longitudinal_matched$subject_id), 1), "\n")
+
+# Check data distribution
+cat("\nALSFRS-R observations by treatment group:\n")
+Longitudinal_matched %>%
+  group_by(Furosemide) %>%
+  summarise(
+    n_subjects = n_distinct(subject_id),
+    n_observations = n(),
+    mean_obs_per_subject = round(n() / n_distinct(subject_id), 1),
+    mean_followup_days = round(mean(ALSFRS_Delta_alsfrs, na.rm = TRUE), 0)
+  ) %>%
+  print()
+
+#-------------------------------------------------------------------------------
+# 10.2 Linear mixed effects model: Rate of ALSFRS-R decline
+#-------------------------------------------------------------------------------
+# Model specification:
+#   - Outcome: ALSFRS_R_Total (total score, 0-48 scale)
+#   - Fixed effects:
+#       * Time (ALSFRS_Delta): Days from baseline
+#       * Treatment (Furosemide): Binary indicator
+#       * Time × Treatment interaction: Tests if decline rate differs by treatment
+#   - Random effects:
+#       * Subject-specific random intercept (accounts for within-subject correlation)
+
+cat("\n=== Fitting Linear Mixed Effects Model ===\n")
+cat("Model: ALSFRS_R_Total ~ Time * Treatment + (1 | subject_id)\n\n")
+
+model_alsfrs <- lmer(
+  ALSFRS_R_Total ~ ALSFRS_Delta_alsfrs * Furosemide + (1 | subject_id),
+  data = Longitudinal_matched
+)
+
+cat("=== ALSFRS-R Mixed Effects Model Results ===\n\n")
+print(summary(model_alsfrs))
+
+cat("\n=== 95% Confidence Intervals for Model Parameters ===\n")
+print(confint(model_alsfrs, method = "Wald"))
+
+################################################################################
+# 11. SURVIVAL ANALYSIS
+################################################################################
+
+cat("\n\n=== Survival Analysis ===\n")
+
+#-------------------------------------------------------------------------------
+# 11.1 Prepare survival dataset
+#-------------------------------------------------------------------------------
+survival_matched <- matched_data %>%
+  mutate(
+    death_or_censored = ifelse(Subject_Died == "Yes", 1, 0),
+    survival_time = Death_Days
+  )
+
+cat("Survival dataset:\n")
+cat("  - Total subjects:", nrow(survival_matched), "\n")
+cat("  - Deaths observed:", sum(survival_matched$death_or_censored == 1), "\n")
+cat("  - Censored subjects:", sum(survival_matched$death_or_censored == 0), "\n")
+
+# Summary by treatment group
+cat("\nSurvival outcomes by treatment group:\n")
+survival_matched %>%
+  group_by(Furosemide) %>%
+  summarise(
+    n = n(),
+    n_deaths = sum(death_or_censored == 1),
+    pct_deaths = round(sum(death_or_censored == 1) / n() * 100, 1),
+    median_survival_time = round(median(survival_time, na.rm = TRUE), 0),
+    mean_survival_time = round(mean(survival_time, na.rm = TRUE), 0)
+  ) %>%
+  print()
+
+#-------------------------------------------------------------------------------
+# 11.2 Cox proportional hazards regression
+#-------------------------------------------------------------------------------
+cat("\n=== Cox Proportional Hazards Model ===\n")
+cat("Model: Surv(time, event) ~ Furosemide\n\n")
+
+cox_model <- coxph(
+  Surv(survival_time, death_or_censored) ~ Furosemide, 
+  data = survival_matched
+)
+
+cat("=== Cox Model Results ===\n\n")
+print(summary(cox_model))
+
+#-------------------------------------------------------------------------------
+# 11.3 Kaplan-Meier survival curves
+#-------------------------------------------------------------------------------
+cat("\n=== Kaplan-Meier Survival Analysis ===\n")
+
+km_fit <- survfit(
+  Surv(survival_time, death_or_censored) ~ Furosemide, 
+  data = survival_matched
+)
+
+cat("Kaplan-Meier survival curves generated\n")
+print(km_fit)
+
+cat("\n=== Median Survival Times ===\n")
+print(summary(km_fit)$table)
+
+# Log-rank test for difference in survival curves
+cat("\n=== Log-Rank Test ===\n")
+logrank_test <- survdiff(
+  Surv(survival_time, death_or_censored) ~ Furosemide, 
+  data = survival_matched
+)
+print(logrank_test)
+
+cat("\n=== Analysis Complete ===\n")
+
