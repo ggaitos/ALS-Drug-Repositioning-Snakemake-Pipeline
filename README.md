@@ -41,6 +41,19 @@ These computational methodologies represent a step forward in finding effective 
 
 **(4) Replication using Electronic Health Records (EHR)**
 
+- As published by Ruth M Pfeiffer et al, 2020 (accessible at https://pubmed.ncbi.nlm.nih.gov/31684770/)
+
+
+**(5) Clinical trial emulation and propensity score matching**
+
+- *MatchIt* R package for propensity scores
+
+- *lme4* R package for linear mixed-effects modeling of longitudinal ALSFRS-R trajectories
+
+- *survival* & *survminer* R packages for survival analyses
+
+- Data were sourced from the Pooled Resource Open-Access ALS Clinical Trials Database (PRO-ACT, https://ncri1.partners.org/PROACT)
+
 
 
 ## Available codes
@@ -52,5 +65,7 @@ Code for each analysis are deposited as individual notebooks in the following fo
 (2) Repurposable drugs using SignatureSearch
 
 (3) Mendelian Randomization using TwoSampleMR
+
+(5) Clinical trial emulation and propensity score matching
 
 
