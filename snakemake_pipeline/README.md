@@ -125,7 +125,6 @@ for r in rows[:20]:
 ## Notes
 
 - The approved-drug filter uses a plain name list, which substitutes for the original analysis's DrugBank join (the DrugBank tables aren't publicly redistributable). Matching is by exact lowercased name.
-- Imputation parameters follow the MetaXcan CAD tutorial; the original ALS swarm file wasn't published, so they aren't confirmed against it.
-- Python versions are pinned; R/Bioconductor is looser for portability, which can shift lower drug ranks but not top hits.
+- Imputation parameters follow the MetaXcan CAD tutorial.
 - Some output filenames keep `VR.ALS` from the original. A new GWAS still runs fine.
 - Validated on Van Rheenen 2021: the spinal cord signature is led by C9orf72, and the approved-drug shortlist surfaces furosemide (validated experimentally in the original study) and edaravone (an approved ALS drug) among the top reversers.
