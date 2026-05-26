@@ -1,4 +1,4 @@
-Steps 1–5 run in the python env, 6–7 in the R env. This is the drug-search trunk of the original analysis; S-MultiXcan (Miami plot only) and the DrugBank approved-only filter are not included.
+Steps 1–5 run in the python env, 6–8 in the R env. This reproduces the drug-search trunk of the original analysis through the approved-drug ranking. S-MultiXcan (used only for a Miami plot in the original) is not included.
 
 ## Requirements
 
@@ -56,7 +56,11 @@ zcat resources/gwas/my_file.txt.gz | head -1
 
 The pipeline expects hg19 with rsIDs. If your file is hg38, point `reference.coordinate_map` at `map_snp150_hg38.txt.gz`. If it has no rsID column, the quick harmonize step won't work as-is.
 
-### Step 6 — Edit `config/config.yaml`
+### Step 6 — Provide an approved-drug list
+
+The final step ranks only approved drugs. Put a plain text file at `resources/drugbank/approved_drugs.txt`, one drug name per line (lowercase). The ALS run used a ~900-drug approved list.
+
+### Step 7 — Edit `config/config.yaml`
 
 Left side is the role the pipeline needs; right side is your file's column name. Comments show the values used for the ALS run.
 
@@ -74,24 +78,27 @@ gwas:
   n_cases: <number of cases>            # ALS: 27205
 signature:
   tissue: <tissue>                      # ALS: Brain_Spinal_cord_cervical_c-1
+drugbank:
+  approved_list: resources/drugbank/approved_drugs.txt
 ```
 
-### Step 7 — Run (inside tmux)
+### Step 8 — Run (inside tmux)
 
 ```bash
 envs/snakemake/bin/snakemake -n                                  # dry run
 envs/snakemake/bin/snakemake --workflow-profile profiles/slurm   # run
 ```
 
-A new `name` writes to its own results folder, so other runs are untouched. Harmonize and format need ~32 GB; set your account and partition in `profiles/slurm/config.yaml`.
+A new `name` writes to its own results folder, so other runs are untouched. Harmonize and format need ~32 GB; set your account and partition in `profiles/slurm/config.yaml`. Run inside tmux so a dropped connection doesn't kill the controller. If a run is interrupted, clear the leftover lock with `snakemake --unlock` before relaunching; it resumes from the last completed step.
 
 ## Output
 
 In `results/<name>/`:
 
-- `spredixcan/` per-tissue gene associations
+- `spredixcan/` gene associations for the signature tissue
 - `signature/ALS.SpinalCord.Signature` the up/down signature
-- `drugs/VR.ALS.lincsmethod.lincsDS.SpinalCordc1FDR.csv` ranked drugs (most negative NCS = strongest reversal)
+- `drugs/VR.ALS.lincsmethod.lincsDS.SpinalCordc1FDR.csv` full ranked LINCS table
+- `drugs/approved_mean_NCS.csv` approved drugs only, one row per drug, ranked by mean NCS (most negative = strongest reversal)
 
 Check the signature has a known disease gene on top (C9orf72 for ALS):
 
@@ -99,7 +106,13 @@ Check the signature has a known disease gene on top (C9orf72 for ALS):
 column -t results/<name>/signature/ALS.SpinalCord.Signature | head
 ```
 
-Sort the drug table as a CSV, not with `sort` (drug names contain commas):
+The approved-drug shortlist is already sorted; view the top candidates:
+
+```bash
+head -20 results/<name>/drugs/approved_mean_NCS.csv
+```
+
+For the full LINCS table, parse as CSV rather than using `sort` (drug names contain commas):
 
 ```python
 import csv
@@ -111,7 +124,8 @@ for r in rows[:20]:
 
 ## Notes
 
+- The approved-drug filter uses a plain name list, which substitutes for the original analysis's DrugBank join (the DrugBank tables aren't publicly redistributable). Matching is by exact lowercased name.
 - Imputation parameters follow the MetaXcan CAD tutorial; the original ALS swarm file wasn't published, so they aren't confirmed against it.
 - Python versions are pinned; R/Bioconductor is looser for portability, which can shift lower drug ranks but not top hits.
 - Some output filenames keep `VR.ALS` from the original. A new GWAS still runs fine.
-- Validated on Van Rheenen 2021: signature led by C9orf72, furosemide a top reverser.
+- Validated on Van Rheenen 2021: the spinal cord signature is led by C9orf72, and the approved-drug shortlist surfaces furosemide (validated experimentally in the original study) and edaravone (an approved ALS drug) among the top reversers.
