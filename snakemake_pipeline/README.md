@@ -56,9 +56,9 @@ zcat resources/gwas/my_file.txt.gz | head -1
 
 The pipeline expects hg19 with rsIDs. If your file is hg38, point `reference.coordinate_map` at `map_snp150_hg38.txt.gz`. If it has no rsID column, the quick harmonize step won't work as-is.
 
-### Step 6 — Provide an approved-drug list
+### Step 6 — Provide a drug list
 
-The final step ranks only approved drugs. Put a plain text file at `resources/drugbank/approved_drugs.txt`, one drug name per line (lowercase). The ALS run used a ~900-drug approved list.
+The final step ranks only selected drugs. Put a plain text file at `resources/drugbank/approved_drugs.txt`, one drug name per line (lowercase). The ALS run used a 1001-drug approved list.
 
 ### Step 7 — Edit `config/config.yaml`
 
